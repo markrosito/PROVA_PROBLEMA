@@ -4,13 +4,13 @@ from solvers.RVNS_solver import RVNS
 def main():
     # --- PASSO 1: CONFIGURAZIONE ---
     # Definisci quale istanza risolvere
-    instance_name = 'test01.json'
-    instance_path = os.path.join('data/ihtc2024_test_dataset', instance_name)
+    instance_name = 'i10.json'
+    instance_path = os.path.join('data', instance_name)
 
     # Definisci un limite di tempo per la ricerca (in secondi)
     # Per un test rapido, 10-30 secondi sono sufficienti.
     # Per una ricerca seria, aumenta a 600 (10 minuti) come da competizione.
-    time_limit = 20 
+    time_limit = 30 
 
     if not os.path.exists(instance_path):
         print(f"Errore: File istanza non trovato in {instance_path}")

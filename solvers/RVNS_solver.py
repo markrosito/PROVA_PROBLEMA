@@ -122,6 +122,7 @@ class RVNS:
             self._neighborhood_change_patient_day,
             self._neighborhood_reschedule_unscheduled,
             self._neighborhood_change_nurse_assignment,
+            self._neighborhood_change_patient_ot
         ]
         self.k_max = len(self.neighborhoods)
 
@@ -156,151 +157,281 @@ class RVNS:
         total_cost = sum(costs.values())
         return total_cost, costs
 
+
     # --- 1. Generazione della Soluzione Iniziale (Greedy) ---
     def _generate_initial_solution(self):
-        print("Generating initial greedy solution...")
+        """
+        Genera una soluzione iniziale valida, che rispetta tutti i vincoli hard,
+        per pazienti e infermieri.
+        """
+        print("Generating initial valid solution...")
         solution = {"patients": [], "nurses": []}
         
-        # Prova a schedulare tutti i pazienti obbligatori
-        mandatory_patients = [p for p in self.hospital.patient_dict.values() if p['mandatory']]
-        for patient in sorted(mandatory_patients, key=lambda p: p['surgery_due_day']):
-            # Trova il primo posto valido
-            for day in range(patient['surgery_release_day'], patient['surgery_due_day'] + 1):
-                # Semplificazione: prova ad assegnare alla prima sala e stanza disponibili
-                room = next((r for r in self.hospital.room_dict.keys() if r not in patient.get('incompatible_room_ids', [])), None)
-                ot = next(iter(self.hospital.operating_theaters_dict.keys()), None)
-                if room and ot:
-                    solution['patients'].append({
-                        "id": patient['id'], "admission_day": day, "room": room, "operating_theater": ot
-                    })
-                    break # Passa al paziente successivo
+        # 1. Schedulazione Pazienti
+        mandatory_patients = sorted([p for p in self.hospital.patient_dict.values() if p['mandatory']], 
+                                    key=lambda p: p['surgery_due_day'])
+        patients_to_schedule = mandatory_patients
         
-        # Assegnazione infermieri semplificata: assegna il primo infermiere disponibile a tutte le stanze occupate
-        occupied_rooms_per_shift = {}
+        for patient in patients_to_schedule:
+            found_valid_assignment = False
+            
+            days_range = range(patient['surgery_release_day'], patient['surgery_due_day'] + 1)
+            rooms_to_try = [r['id'] for r in self.hospital.rooms if r['id'] not in patient.get('incompatible_room_ids', [])]
+            ots_to_try = [ot['id'] for ot in self.hospital.operating_theaters]
+
+            random.shuffle(rooms_to_try)
+            random.shuffle(ots_to_try)
+            
+            for day in days_range:
+                for room_id in rooms_to_try:
+                    for ot_id in ots_to_try:
+                        
+                        temp_solution = copy.deepcopy(solution)
+                        temp_solution['patients'].append({
+                            "id": patient['id'],
+                            "admission_day": day,
+                            "room": room_id,
+                            "operating_theater": ot_id
+                        })
+                        
+                        # Controlla se la nuova assegnazione paziente viola i vincoli hard
+                        if not constraints.h1_no_gender_mix(temp_solution, self.hospital) and \
+                        not constraints.h2_compatible_rooms(temp_solution, self.hospital) and \
+                        not constraints.h7_room_capacity(temp_solution, self.hospital) and \
+                        not constraints.h3_surgeon_overtime(temp_solution, self.hospital) and \
+                        not constraints.h4_ot_overtime(temp_solution, self.hospital) and \
+                        not constraints.h6_admission_day(temp_solution, self.hospital):
+                            
+                            solution = temp_solution
+                            found_valid_assignment = True
+                            break
+                    if found_valid_assignment:
+                        break
+                if found_valid_assignment:
+                    break
+            
+            if not found_valid_assignment:
+                print(f"Warning: Could not find a valid assignment for mandatory patient {patient['id']}")
+
+        # 2. Assegnazione Iniziale Infermieri
+        nurse_assignments_by_id = {}
         for p_sol in solution['patients']:
             patient = self.hospital.get_patient_by_id(p_sol['id'])
+            if not patient: continue
+            
             for day_offset in range(patient['length_of_stay']):
                 day = p_sol['admission_day'] + day_offset
-                for shift_name in self.hospital.shift_types:
-                    key = (day, shift_name)
-                    if key not in occupied_rooms_per_shift: occupied_rooms_per_shift[key] = set()
-                    occupied_rooms_per_shift[key].add(p_sol['room'])
-        
-        nurse_assignments = {}
-        for (day, shift_name), rooms in occupied_rooms_per_shift.items():
-            # Trova un infermiere che lavora in quel turno
-            available_nurse = next((n_id for n_id, n in self.hospital.nurses_dict.items() if any(ws['day'] == day and ws['shift'] == shift_name for ws in n['working_shifts'])), None)
-            if available_nurse:
-                if available_nurse not in nurse_assignments: nurse_assignments[available_nurse] = []
-                nurse_assignments[available_nurse].append({"day": day, "shift": shift_name, "rooms": list(rooms)})
-        
-        solution['nurses'] = [{"id": n_id, "assignments": assigns} for n_id, assigns in nurse_assignments.items()]
-        
+                if day >= self.hospital.days: continue
+                
+                for shift_idx, shift_name in enumerate(self.hospital.shift_types):
+                    
+                    # Calcola il livello di skill richiesto dal paziente per quel giorno/turno
+                    req_idx = day_offset * len(self.hospital.shift_types) + shift_idx
+                    required_skill = patient['skill_level_required'][req_idx]
+                    
+                    # Trova un infermiere disponibile e con la skill richiesta
+                    available_nurses = [
+                        n for n in self.hospital.nurses if 
+                        any(ws['day'] == day and ws['shift'] == shift_name for ws in n['working_shifts']) and
+                        n['skill_level'] >= required_skill
+                    ]
+                    
+                    if available_nurses:
+                        nurse_to_assign = random.choice(available_nurses)
+                        nurse_id = nurse_to_assign['id']
+                        room_id = p_sol['room']
+                        
+                        # Aggiorna l'assegnazione nella struttura temporanea
+                        if nurse_id not in nurse_assignments_by_id:
+                            nurse_assignments_by_id[nurse_id] = []
+                            
+                        found_assignment = False
+                        for assignment in nurse_assignments_by_id[nurse_id]:
+                            if assignment['day'] == day and assignment['shift'] == shift_name:
+                                if room_id not in assignment['rooms']:
+                                    assignment['rooms'].append(room_id)
+                                found_assignment = True
+                                break
+                        
+                        if not found_assignment:
+                            nurse_assignments_by_id[nurse_id].append({
+                                "day": day,
+                                "shift": shift_name,
+                                "rooms": [room_id]
+                            })
+
+        solution['nurses'] = [{"id": n_id, "assignments": assigns} for n_id, assigns in nurse_assignments_by_id.items()]
+
         return solution
 
     # --- 2. Strutture di Vicinato ---
     def _neighborhood_change_patient_room(self, solution):
-        if not solution['patients']: return solution
-        p_sol = random.choice(solution['patients'])
+        s_prime = copy.deepcopy(solution)
+        if not s_prime['patients']:
+            return s_prime
+
+        p_sol = random.choice(s_prime['patients'])
         patient = self.hospital.get_patient_by_id(p_sol['id'])
+
+        available_rooms = [
+            r for r in self.hospital.room_dict.keys() 
+            if r not in patient.get('incompatible_room_ids', []) 
+            and r != p_sol['room']
+        ]
         
-        available_rooms = [r for r in self.hospital.room_dict.keys() if r not in patient.get('incompatible_room_ids', []) and r != p_sol['room']]
         if available_rooms:
-            p_sol['room'] = random.choice(available_rooms)
-        return solution
+            original_room = p_sol['room']
+            random.shuffle(available_rooms)
+            
+            for new_room in available_rooms:
+                p_sol['room'] = new_room
+                
+                # Controlla i vincoli hard che potrebbero essere violati
+                if not constraints.h1_no_gender_mix(s_prime, self.hospital) and \
+                not constraints.h2_compatible_rooms(s_prime, self.hospital) and \
+                not constraints.h7_room_capacity(s_prime, self.hospital):
+                    # La mossa è valida, esci dal ciclo
+                    return s_prime
+            
+            # Se nessun'altra stanza è valida, ripristina la stanza originale
+            p_sol['room'] = original_room
+
+        return s_prime
 
     def _neighborhood_change_patient_day(self, solution):
-        if not solution['patients']: return solution
-        p_sol = random.choice(solution['patients'])
+        s_prime = copy.deepcopy(solution)
+        if not s_prime['patients']:
+            return s_prime
+
+        p_sol = random.choice(s_prime['patients'])
         patient = self.hospital.get_patient_by_id(p_sol['id'])
-        
+
         due_day = patient.get('surgery_due_day', self.hospital.days - patient['length_of_stay'])
-        new_day = random.randint(patient['surgery_release_day'], due_day)
-        p_sol['admission_day'] = new_day
-        return solution
+        original_day = p_sol['admission_day']
+
+        days_to_try = list(range(patient['surgery_release_day'], due_day + 1))
+        days_to_try.remove(original_day)
+        random.shuffle(days_to_try)
+
+        for new_day in days_to_try:
+            p_sol['admission_day'] = new_day
+
+            # Controlla i vincoli hard che potrebbero essere violati
+            if not constraints.h6_admission_day(s_prime, self.hospital) and \
+            not constraints.h3_surgeon_overtime(s_prime, self.hospital) and \
+            not constraints.h4_ot_overtime(s_prime, self.hospital):
+                return s_prime
+            
+        # Se nessun giorno è valido, ripristina il giorno originale
+        p_sol['admission_day'] = original_day
+        
+        return s_prime
         
     def _neighborhood_reschedule_unscheduled(self, solution):
-        # Prova a schedulare un paziente opzionale non schedulato
-        admitted_ids = {p['id'] for p in solution['patients']}
-        unscheduled_optionals = [p for p_id, p in self.hospital.patient_dict.items() if not p['mandatory'] and p_id not in admitted_ids]
+        s_prime = copy.deepcopy(solution)
+        admitted_ids = {p['id'] for p in s_prime['patients']}
+        unscheduled_optionals = [
+            p for p_id, p in self.hospital.patient_dict.items() 
+            if not p['mandatory'] and p_id not in admitted_ids
+        ]
         
         if unscheduled_optionals:
             patient = random.choice(unscheduled_optionals)
-            # Logica simile a quella iniziale per trovare un posto
-            day = random.randint(patient['surgery_release_day'], self.hospital.days - patient['length_of_stay'])
-            room = random.choice(list(self.hospital.room_dict.keys()))
-            ot = random.choice(list(self.hospital.operating_theaters_dict.keys()))
-            solution['patients'].append({"id": patient['id'], "admission_day": day, "room": room, "operating_theater": ot})
-        return solution
+            
+            days_to_try = list(range(patient['surgery_release_day'], self.hospital.days - patient['length_of_stay']))
+            rooms_to_try = list(self.hospital.room_dict.keys())
+            ots_to_try = list(self.hospital.operating_theaters_dict.keys())
+            
+            random.shuffle(days_to_try)
+            random.shuffle(rooms_to_try)
+            random.shuffle(ots_to_try)
+            
+            for day in days_to_try:
+                for room in rooms_to_try:
+                    for ot in ots_to_try:
+                        new_patient_assignment = {
+                            "id": patient['id'], "admission_day": day, 
+                            "room": room, "operating_theater": ot
+                        }
+                        
+                        # Crea una copia temporanea con la nuova assegnazione
+                        temp_solution = copy.deepcopy(s_prime)
+                        temp_solution['patients'].append(new_patient_assignment)
+                        
+                        # Controlla i vincoli hard
+                        if not constraints.h1_no_gender_mix(temp_solution, self.hospital) and \
+                        not constraints.h2_compatible_rooms(temp_solution, self.hospital) and \
+                        not constraints.h7_room_capacity(temp_solution, self.hospital) and \
+                        not constraints.h3_surgeon_overtime(temp_solution, self.hospital) and \
+                        not constraints.h4_ot_overtime(temp_solution, self.hospital) and \
+                        not constraints.h6_admission_day(temp_solution, self.hospital):
+                            
+                            s_prime['patients'].append(new_patient_assignment)
+                            return s_prime
+                            
+        return s_prime
 
     def _neighborhood_change_nurse_assignment(self, solution):
-        """
-        Operatore di vicinato: Riassegnazione Infermiere.
-        Sceglie un'assegnazione infermiere-paziente e prova a cambiare il paziente
-        con un altro paziente valido per lo stesso infermiere nello stesso turno.
-        Modifica la soluzione "in-place".
-        """
-        # 1. Controllo di sicurezza: se non ci sono assegnazioni, esci
-        if not solution['nurses'] or not any(nurse.get('assignments') for nurse in solution['nurses']):
-            return solution
+        s_prime = copy.deepcopy(solution)
+        if not s_prime['nurses'] or len(s_prime['nurses']) < 2:
+            return s_prime
 
-        # 2. Scegli casualmente un'assegnazione da modificare
-        #    'assignment_sol' è un riferimento a un dizionario dentro la lista della soluzione -à
-        nurse = random.choice([n for n in solution['nurses'] if n.get('assignments')])
-        assignment_sol = random.choice(nurse['assignments'])
+        # Trova un'assegnazione casuale (assegnazione A)
+        nurse_a_obj = random.choice([n for n in s_prime['nurses'] if n['assignments']])
+        assignment_a = random.choice(nurse_a_obj['assignments'])
+        
+        candidates_b = []
+        for nurse_b_obj in s_prime['nurses']:
+            if nurse_b_obj['id'] == nurse_a_obj['id']:
+                continue
+            
+            for assignment_b in nurse_b_obj['assignments']:
+                if assignment_b['day'] == assignment_a['day'] and \
+                assignment_b['shift'] == assignment_a['shift'] and \
+                set(assignment_b['rooms']).isdisjoint(set(assignment_a['rooms'])):
+                    candidates_b.append((nurse_b_obj, assignment_b))
 
-        available_patients = []
-        
-        # Estrai le informazioni necessarie dall'assegnazione scelta
-        nurse_id = nurse['id']
-        shift = assignment_sol['shift']
-        #current_patient_id = assignment_sol.get('patient_id', None)
-        
-        # 3. Trova i pazienti alternativi e validi
-        #    Questa è la parte più importante e richiede delle assunzioni sul tuo modello "hospital"
-        
-        # Assunzione 1: Esiste un metodo che restituisce gli ID dei pazienti che richiedono
-        # cure in un determinato turno.
-        for day in range(1, self.hospital.days + 1):
-            for shift in self.hospital.shift_types:
-                candidate_patients = list(self.hospital.get_all_patients_in_rooms(solution))
-                # Filtra i pazienti per il giorno corrente
-                filtered_patients = [c for c in candidate_patients if c[0] == day-1]  # and assignment_sol['shift'] == shift
-                if filtered_patients:
-                    candidate_patient_ids = [p[2]['id'] for p in filtered_patients]
-                    #print(f"1. Candidate patients for nurse {nurse_id} in shift {shift}: {candidate_patient_ids}")
-                  
-        # Assunzione 2: Esiste un metodo per verificare se un infermiere ha le competenze
-        # necessarie per un determinato paziente.                
-                for p_id in candidate_patient_ids:
-                    for p in list(self.hospital.occupants) + solution['patients']:
-                        if p in solution['patients'] and p['id'] == p_id:
-                            admission_day = p['admission_day']
-                            skill_index = 3 * (day-1) - admission_day + self.hospital.shift_types.index(shift)
-                            skill_levels = self.hospital.get_patient_by_id(p_id)['skill_level_required']
-                            if 0 <= skill_index < len(skill_levels):
-                                if self.hospital.get_nurse_by_id(nurse_id)['skill_level'] >= skill_levels[skill_index] and p_id not in available_patients:
-                                    available_patients.append(p_id)
-                                    print(f"2. Checking patient {p_id} for nurse {nurse_id} on day {day}, shift {shift}: skill index {skill_index}")
-                                available_patients.append(p_id)
-                                print(f"2. Checking patient {p_id} for nurse {nurse_id} on day {day}, shift {shift}: skill index {skill_index}")
-                        elif p['id'] == p_id:
-                            skill_index = 3 * (day-1) + self.hospital.shift_types.index(shift)
-                            print(f"skill index: {skill_index}")
-                            skill_levels = self.hospital.get_patient_by_id(p_id)['skill_level_required']
-                            if 0 <= skill_index < len(skill_levels):
-                                if self.hospital.get_nurse_by_id(nurse_id)['skill_level'] >= skill_levels[skill_index] and p_id not in available_patients:
-                                    available_patients.append(p_id)
-                                    print(f"2. Checking patient {p_id} for nurse {nurse_id} on day {day}, shift {shift}: skill index {skill_index}")
-                                
-        assignment_sol['patient_id'] = random.choice(available_patients)
-        available_patients = []  # Reset per il prossimo ciclo
-        
-        # 4. Se esistono alternative valide, scegline una e modifica la soluzione
-        # Modifica direttamente l'oggetto 'assignment_sol', che aggiorna la soluzione generale
+        if candidates_b:
+            nurse_b_obj, assignment_b = random.choice(candidates_b)
+            
+            rooms_a = assignment_a['rooms']
+            rooms_b = assignment_b['rooms']
+            
+            assignment_a['rooms'] = rooms_b
+            assignment_b['rooms'] = rooms_a
+            
+            # Controlla se la mossa ha violato qualche vincolo hard
+            # Se la validazione passa, restituisci la soluzione modificata
+            if not constraints.h1_no_gender_mix(s_prime, self.hospital) and \
+            not constraints.h7_room_capacity(s_prime, self.hospital):
+                return s_prime
 
-        # 5. Restituisci la soluzione (modificata o meno)
         return solution
+    
+    def _neighborhood_change_patient_ot(self, solution):
+        s_prime = copy.deepcopy(solution)
+        if not s_prime['patients']:
+            return s_prime
+        
+        p_sol = random.choice(s_prime['patients'])
+        original_ot = p_sol['operating_theater']
+        
+        available_ots = [ot for ot in self.hospital.operating_theaters_dict.keys() if ot != original_ot]
+
+        if available_ots:
+            random.shuffle(available_ots)
+            
+            for new_ot in available_ots:
+                p_sol['operating_theater'] = new_ot
+                
+                # Controlla i vincoli hard che potrebbero essere violati
+                if not constraints.h3_surgeon_overtime(s_prime, self.hospital) and \
+                not constraints.h4_ot_overtime(s_prime, self.hospital):
+                    return s_prime
+                    
+            p_sol['operating_theater'] = original_ot
+            
+        return s_prime
 
     # --- 3. Shake ---
     def _shake(self, solution, k):
