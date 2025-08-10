@@ -159,23 +159,37 @@ class RVNS:
 
 
     # --- 1. Generazione della Soluzione Iniziale (Greedy) ---
+    # In RVNS_solver.py
+
     def _generate_initial_solution(self):
         """
-        Genera una soluzione iniziale valida, che rispetta tutti i vincoli hard,
-        per pazienti e infermieri.
+        Genera una soluzione iniziale valida, provando a schedulare prima tutti i pazienti
+        obbligatori e poi aggiungendo avidamente i pazienti opzionali.
         """
-        print("Generating initial valid solution...")
+        print("Generating enhanced initial solution...")
         solution = {"patients": [], "nurses": []}
+
+        # Ordina i pazienti: prima gli obbligatori (per data di scadenza), poi gli opzionali (per data di rilascio)
+        mandatory_patients = sorted([p for p in self.hospital.patient_dict.values() if p.get('mandatory')], 
+                                    key=lambda p: p.get('surgery_due_day', float('inf')))
+        optional_patients = sorted([p for p in self.hospital.patient_dict.values() if not p.get('mandatory')], 
+                                key=lambda p: p['surgery_release_day'])
         
-        # 1. Schedulazione Pazienti
-        mandatory_patients = sorted([p for p in self.hospital.patient_dict.values() if p['mandatory']], 
-                                    key=lambda p: p['surgery_due_day'])
-        patients_to_schedule = mandatory_patients
-        
+        patients_to_schedule = mandatory_patients + optional_patients
+
         for patient in patients_to_schedule:
             found_valid_assignment = False
             
-            days_range = range(patient['surgery_release_day'], patient['surgery_due_day'] + 1)
+            # Definisci il range di giorni possibili
+            release_day = patient['surgery_release_day']
+            # Per gli opzionali, il due_day non esiste. Usiamo un limite ragionevole.
+            due_day = patient.get('surgery_due_day', self.hospital.days - patient['length_of_stay'])
+            
+            # Assicurati che il range sia valido
+            if release_day > due_day:
+                continue
+                
+            days_range = range(release_day, due_day + 1)
             rooms_to_try = [r['id'] for r in self.hospital.rooms if r['id'] not in patient.get('incompatible_room_ids', [])]
             ots_to_try = [ot['id'] for ot in self.hospital.operating_theaters]
 
@@ -210,55 +224,55 @@ class RVNS:
                 if found_valid_assignment:
                     break
             
-            if not found_valid_assignment:
+            if not found_valid_assignment and patient['mandatory']:
                 print(f"Warning: Could not find a valid assignment for mandatory patient {patient['id']}")
 
-        # 2. Assegnazione Iniziale Infermieri
+        # 2. Assegnazione Iniziale Infermieri (INVARIATA)
         nurse_assignments_by_id = {}
-        for p_sol in solution['patients']:
-            patient = self.hospital.get_patient_by_id(p_sol['id'])
-            if not patient: continue
-            
-            for day_offset in range(patient['length_of_stay']):
-                day = p_sol['admission_day'] + day_offset
-                if day >= self.hospital.days: continue
-                
-                for shift_idx, shift_name in enumerate(self.hospital.shift_types):
-                    
-                    # Calcola il livello di skill richiesto dal paziente per quel giorno/turno
-                    req_idx = day_offset * len(self.hospital.shift_types) + shift_idx
+        all_patients_in_rooms = self.hospital.get_all_patients_in_rooms(solution) # Ricrea la mappa per l'assegnazione
+        
+        # Raggruppa le richieste per (giorno, turno, stanza)
+        room_shift_requirements = {}
+        for day, room_id, patient in all_patients_in_rooms:
+            for shift_idx, shift_name in enumerate(self.hospital.shift_types):
+                day_offset = day - patient.get('admission_day', 0)
+                req_idx = day_offset * len(self.hospital.shift_types) + shift_idx
+
+                if 0 <= req_idx < len(patient['skill_level_required']):
                     required_skill = patient['skill_level_required'][req_idx]
+                    key = (day, shift_name, room_id)
+                    current_max_skill = room_shift_requirements.get(key, -1)
+                    room_shift_requirements[key] = max(current_max_skill, required_skill)
+
+        # Assegna gli infermieri
+        for (day, shift_name, room_id), required_skill in room_shift_requirements.items():
+            available_nurses = [
+                n for n in self.hospital.nurses if 
+                any(ws['day'] == day and ws['shift'] == shift_name for ws in n['working_shifts']) and
+                n['skill_level'] >= required_skill
+            ]
+            
+            if available_nurses:
+                nurse_to_assign = random.choice(available_nurses)
+                nurse_id = nurse_to_assign['id']
+                
+                if nurse_id not in nurse_assignments_by_id:
+                    nurse_assignments_by_id[nurse_id] = []
                     
-                    # Trova un infermiere disponibile e con la skill richiesta
-                    available_nurses = [
-                        n for n in self.hospital.nurses if 
-                        any(ws['day'] == day and ws['shift'] == shift_name for ws in n['working_shifts']) and
-                        n['skill_level'] >= required_skill
-                    ]
-                    
-                    if available_nurses:
-                        nurse_to_assign = random.choice(available_nurses)
-                        nurse_id = nurse_to_assign['id']
-                        room_id = p_sol['room']
-                        
-                        # Aggiorna l'assegnazione nella struttura temporanea
-                        if nurse_id not in nurse_assignments_by_id:
-                            nurse_assignments_by_id[nurse_id] = []
-                            
-                        found_assignment = False
-                        for assignment in nurse_assignments_by_id[nurse_id]:
-                            if assignment['day'] == day and assignment['shift'] == shift_name:
-                                if room_id not in assignment['rooms']:
-                                    assignment['rooms'].append(room_id)
-                                found_assignment = True
-                                break
-                        
-                        if not found_assignment:
-                            nurse_assignments_by_id[nurse_id].append({
-                                "day": day,
-                                "shift": shift_name,
-                                "rooms": [room_id]
-                            })
+                found_assignment = False
+                for assignment in nurse_assignments_by_id[nurse_id]:
+                    if assignment['day'] == day and assignment['shift'] == shift_name:
+                        if room_id not in assignment['rooms']:
+                            assignment['rooms'].append(room_id)
+                        found_assignment = True
+                        break
+                
+                if not found_assignment:
+                    nurse_assignments_by_id[nurse_id].append({
+                        "day": day,
+                        "shift": shift_name,
+                        "rooms": [room_id]
+                    })
 
         solution['nurses'] = [{"id": n_id, "assignments": assigns} for n_id, assigns in nurse_assignments_by_id.items()]
 

@@ -4,7 +4,7 @@ from solvers.RVNS_solver import RVNS
 def main():
     # --- PASSO 1: CONFIGURAZIONE ---
     # Definisci quale istanza risolvere
-    instance_name = 'i10.json'
+    instance_name = 'i14.json'
     instance_path = os.path.join('data', instance_name)
 
     # Definisci un limite di tempo per la ricerca (in secondi)
